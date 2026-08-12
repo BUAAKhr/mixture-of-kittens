@@ -12,6 +12,24 @@ The loopback backend validates chunk ownership, partial chunks, exactly-once
 phase publication, epoch reuse, and timeout behavior.  It is not a performance
 model for NVLink or RDMA.
 
+The NCCL reference benchmark can emulate two logical four-GPU nodes on one
+eight-GPU host.  This validates communicator ordering and hierarchical BF16
+semantics, but all traffic still uses the host's NVLink/NVSwitch fabric.  Every
+record therefore carries `"emulated_nodes": true` and must not be reported as
+an RDMA result:
+
+```bash
+OMP_NUM_THREADS=1 torchrun --standalone --nproc-per-node=8 -- \
+  -m benchmarks.pdl_gemm_ar.multinode.benchmark \
+  --logical-local-world-size 4 --correctness-only
+
+OMP_NUM_THREADS=1 torchrun --standalone --nproc-per-node=8 -- \
+  -m benchmarks.pdl_gemm_ar.multinode.benchmark \
+  --logical-local-world-size 4 --chunk-kib 64,128,256,512,1024 \
+  --depths 1,2,4,8 --warmups 20 --iterations 100 \
+  --output benchmarks/pdl_gemm_ar/multinode/results/logical_2x4.jsonl
+```
+
 This experiment keeps the pinned ParallelKittens BF16 `128x256x64`, four-stage
 GEMM and NVLS AllReduce arithmetic while comparing execution organization:
 

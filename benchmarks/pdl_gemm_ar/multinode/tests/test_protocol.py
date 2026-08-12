@@ -4,6 +4,7 @@ import threading
 import unittest
 
 from ..loopback_backend import LoopbackTransport
+from ..cost_model import PipelineCost
 from ..protocol import (
     ChunkPlan,
     CompletionBoard,
@@ -101,6 +102,24 @@ class LoopbackTest(unittest.TestCase):
         transport.reset(2)
         self.assertTrue(all(phase == Phase.EMPTY for phase in transport.board.snapshot()))
         transport.close()
+
+
+class CostModelTest(unittest.TestCase):
+    def test_pipeline_bound_and_overlap_efficiency(self) -> None:
+        model = PipelineCost(
+            local_reduce_ms=4.0,
+            inter_node_ms=8.0,
+            local_broadcast_ms=4.0,
+            control_ms=1.0,
+            num_chunks=4,
+            observed_sequential_ms=17.0,
+            observed_pipeline_ms=11.0,
+            flat_ms=20.0,
+        )
+        self.assertEqual(model.isolated_sequential_ms, 17.0)
+        self.assertEqual(model.lower_bound_ms, 11.0)
+        self.assertEqual(model.overlap_efficiency, 1.0)
+        self.assertEqual(model.perfect_overlap_opportunity_vs_flat, 0.45)
 
 
 if __name__ == "__main__":
