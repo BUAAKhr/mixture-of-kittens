@@ -1,5 +1,9 @@
 # ParallelKittens GEMM+AllReduce scheduling comparison
 
+The node-local/node-global co-design and its execution gates are specified in
+[`multinode/DESIGN.md`](multinode/DESIGN.md).  The implementation is BF16-only
+until that hierarchy demonstrates a measured end-to-end benefit.
+
 The follow-on hierarchical BF16 work lives in [`multinode/`](multinode/).  Its
 transport-neutral protocol deliberately separates same-node NVLS scheduling
 from inter-node completion.  Start with the dependency-free protocol tests:
@@ -14,9 +18,11 @@ model for NVLink or RDMA.
 
 The NCCL reference benchmark can emulate two logical four-GPU nodes on one
 eight-GPU host.  This validates communicator ordering and hierarchical BF16
-semantics, but all traffic still uses the host's NVLink/NVSwitch fabric.  Every
-record therefore carries `"emulated_nodes": true` and must not be reported as
-an RDMA result:
+semantics, but all traffic still uses the host's NVLink/NVSwitch fabric.  Its
+`windowed` mode batches asynchronous submissions; it is not the GPU-ready
+tile pipeline implemented by the ParallelKittens data path.  Every record
+therefore carries `"emulated_nodes": true` and must not be reported as an RDMA
+or tile-overlap result:
 
 ```bash
 OMP_NUM_THREADS=1 torchrun --standalone --nproc-per-node=8 -- \
@@ -301,3 +307,69 @@ warp-specialized `setmaxnreg` targets are not fully represented by a single
   median/mean/p95 are computed.
 - Shape alternatives in `resource_model.py` are analytical diagnostics, not
   performance-equivalent replacements for the accepted four-stage kernel.
+
+## Two-node hierarchical BF16 experiment
+
+The multi-node code is under `multinode/`; its protocol and measurement
+contract are documented in `multinode/DESIGN.md`.  Compression is deliberately
+excluded from this first gate.  The path under test is:
+
+```text
+PK GEMM tile -> NVLS owner pack -> NCCL/UCCL owner lane -> NVLS multicast
+```
+
+The launcher is preflight-only unless both an explicit run flag and a reviewed
+approval file are present.  Run it from either node with the same repository
+SHA and explicit NIC variables:
+
+Do not invoke these commands until execution has been explicitly approved.
+The first approved steps are local syntax/unit checks and a PTXAS build gate;
+two-node preflight comes only after those pass.
+
+```bash
+NODE_RANK=0 MASTER_ADDR=<node0> \
+NCCL_SOCKET_IFNAME=<ifname> NCCL_IB_HCA=<hca-list> NCCL_IB_GID_INDEX=<gid> \
+bash benchmarks/pdl_gemm_ar/multinode/run_2node.sh
+```
+
+After collecting both node snapshots, compare them on a review machine:
+
+```bash
+python -m benchmarks.pdl_gemm_ar.multinode.compare_preflight \
+  /path/preflight_node0.json /path/preflight_node1.json \
+  --output /path/preflight_approval.json
+```
+
+Only after approval, pass the same approval JSON to both nodes.  The first run
+is correctness only, followed by a separate stream-order instrumentation gate,
+latency, and isolated stages.  Use `TRIAL_ID=0,1,2` in distinct latency
+torchrun processes; the launcher derives a different randomized mode order for
+each trial and only global rank 0 writes a JSONL file:
+
+```bash
+RUN_BENCHMARK=1 RUN_PHASE=correctness \
+PREFLIGHT_APPROVAL_FILE=/path/preflight_approval.json \
+bash benchmarks/pdl_gemm_ar/multinode/run_2node.sh
+
+RUN_BENCHMARK=1 RUN_PHASE=latency TRIAL_ID=0 \
+PREFLIGHT_APPROVAL_FILE=/path/preflight_approval.json \
+bash benchmarks/pdl_gemm_ar/multinode/run_2node.sh
+
+RUN_BENCHMARK=1 RUN_PHASE=stages WINDOW_TILES=4 MAX_INFLIGHT=1 \
+PREFLIGHT_APPROVAL_FILE=/path/preflight_approval.json \
+bash benchmarks/pdl_gemm_ar/multinode/run_2node.sh
+
+RUN_BENCHMARK=1 RUN_PHASE=instrument MODES=pdl_tile \
+WINDOW_TILES=4 MAX_INFLIGHT=1 WARMUPS=2 ITERATIONS=3 \
+PREFLIGHT_APPROVAL_FILE=/path/preflight_approval.json \
+bash benchmarks/pdl_gemm_ar/multinode/run_2node.sh
+```
+
+`run_2node_uccl_plugin.sh` uses the identical matrix through the UCCL NCCL net
+plugin.  Set `UCCL_PLUGIN_PATH` to the absolute plugin binary before preflight;
+the launcher assigns the same path to `NCCL_NET_PLUGIN`, and the approval binds
+its SHA256.  The stage decomposition records local GEMM, NVLS owner pack,
+GPU-ready control, owner-lane network, NVLS unpack, and the node-local completion
+join.  It also measures empty window orchestration so that overhead is not
+triple-counted across ready/network/unpack stages.  Its ideal-overlap value is
+an analytical estimate, not a formal bound or measured latency.

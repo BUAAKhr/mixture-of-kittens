@@ -7,8 +7,10 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/csrc/utils/pybind.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <string>
 
@@ -38,6 +40,7 @@ namespace pdl_gemm_ar {
 
 constexpr int NUM_SMS = pk_fused_config::NUM_BLOCKS;
 constexpr int TRACE_POINTS = 4;
+constexpr uint32_t MAX_HIERARCHICAL_EPOCH = (1u << 31) - 1;
 
 __device__ __forceinline__ coord<ducks::default_type> grid_local_count() {
     return {1, 0, 1};
@@ -53,6 +56,11 @@ __device__ __forceinline__ coord<ducks::default_type> reset_pre_count() {
 
 __device__ __forceinline__ coord<ducks::default_type> reset_post_count() {
     return {1, 0, 4};
+}
+
+__device__ __forceinline__ coord<ducks::default_type>
+hierarchical_join_slot(int source_dev_idx) {
+    return {1, 0, 5 + source_dev_idx};
 }
 
 template <typename Globals>
@@ -849,6 +857,282 @@ void split_communication_kernel(
     }
 }
 
+constexpr int HIERARCHICAL_TILE_ELEMENTS =
+    pk_fused_globals::ROW_BLOCK * pk_fused_globals::COL_BLOCK;
+
+__device__ __forceinline__ void publish_owner_slot(
+    uint32_t *ready,
+    uint32_t *error,
+    int slot,
+    uint32_t epoch
+) {
+    uint32_t previous;
+    asm volatile(
+        "atom.acq_rel.sys.global.cas.b32 %0, [%1], %2, %3;"
+        : "=r"(previous)
+        : "l"(&ready[slot]), "r"(epoch - 1), "r"(epoch)
+        : "memory"
+    );
+    if (previous != epoch - 1) {
+        uint32_t ignored;
+        const uint32_t code = 0x40000000u | static_cast<uint32_t>(slot);
+        asm volatile(
+            "atom.relaxed.sys.global.cas.b32 %0, [%1], %2, %3;"
+            : "=r"(ignored)
+            : "l"(error), "r"(0u), "r"(code)
+            : "memory"
+        );
+        asm volatile(
+            "st.release.sys.global.u32 [%0], %1;"
+            :: "l"(&ready[slot]), "r"(epoch) : "memory"
+        );
+    }
+}
+
+template <int NUM_THREADS>
+__global__ __launch_bounds__(NUM_THREADS, 1)
+void hierarchical_pack_kernel(
+    const __grid_constant__ pk_fused_globals G,
+    bf16 *wire,
+    uint32_t *ready,
+    uint32_t *error,
+    uint32_t epoch,
+    WaitMode wait_mode
+) {
+    const int row_blocks = G.A.rows() / pk_fused_globals::ROW_BLOCK;
+    const int col_blocks = G.B.cols() / pk_fused_globals::COL_BLOCK;
+    const int super_rows = (row_blocks / pk_fused_globals::SUPER_M)
+        * pk_fused_globals::SUPER_M;
+    const int final_rows = row_blocks - super_rows;
+    const int super_blocks = pk_fused_globals::SUPER_M * col_blocks;
+    const int num_blocks = row_blocks * col_blocks;
+
+    if (wait_mode == WaitMode::PDL_GRID) kittens::pdl::wait();
+    if (wait_mode == WaitMode::GRID_COUNTER || wait_mode == WaitMode::PDL_GRID) {
+        if (threadIdx.x == 0) {
+            wait_counter_acquire(
+                G.barrier,
+                grid_ready_count(),
+                G.dev_idx,
+                pk_fused_globals::NUM_DEVICES
+            );
+        }
+        __syncthreads();
+    }
+
+    for (
+        int task_id = pk_fused_globals::NUM_DEVICES * blockIdx.x + G.dev_idx;
+        task_id < num_blocks;
+        task_id += pk_fused_globals::NUM_DEVICES * gridDim.x
+    ) {
+        int row_idx, col_idx;
+        task_to_tile(
+            task_id,
+            super_rows,
+            final_rows,
+            super_blocks,
+            col_blocks,
+            row_idx,
+            col_idx
+        );
+        if (wait_mode == WaitMode::TILE_COUNTER) {
+            if (threadIdx.x == 0) {
+                wait_counter_acquire(
+                    G.barrier,
+                    {row_idx, col_idx},
+                    G.dev_idx,
+                    pk_fused_globals::NUM_DEVICES
+                );
+            }
+            __syncthreads();
+        }
+
+        const int slot = task_id / pk_fused_globals::NUM_DEVICES;
+        auto *wire_pairs = reinterpret_cast<bf16_2 *>(
+            wire + static_cast<size_t>(slot) * HIERARCHICAL_TILE_ELEMENTS
+        );
+        constexpr int PAIRS_PER_TILE = HIERARCHICAL_TILE_ELEMENTS / 2;
+        for (int pair = threadIdx.x; pair < PAIRS_PER_TILE; pair += blockDim.x) {
+            const int element = pair * 2;
+            const int local_row = element / pk_fused_globals::COL_BLOCK;
+            const int local_col = element % pk_fused_globals::COL_BLOCK;
+            auto *multicast_ptr = reinterpret_cast<bf16_2 *>(
+                G.C.mc_ptr_at({
+                    0,
+                    0,
+                    row_idx * pk_fused_globals::ROW_BLOCK + local_row,
+                    col_idx * pk_fused_globals::COL_BLOCK + local_col
+                })
+            );
+            bf16_2 reduced;
+            multimem<bf16_2>::ld_reduce<
+                reduce_op::ADD,
+                memory_model::STRONG
+            >(reduced, multicast_ptr);
+            move<bf16_2>::stg(&wire_pairs[pair], reduced);
+        }
+        // Every writer publishes its own stores before thread 0 advances the
+        // slot epoch.  The network stream waits on that epoch before NCCL or
+        // a future RDMA backend reads the contiguous owner wire.
+        __threadfence_system();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            publish_owner_slot(ready, error, slot, epoch);
+        }
+        __syncthreads();
+    }
+}
+
+template <int NUM_THREADS>
+__global__ __launch_bounds__(NUM_THREADS, 1)
+void hierarchical_unpack_kernel(
+    pk_fused_globals::C_pgl C,
+    const bf16 *wire,
+    int dev_idx,
+    int row_blocks,
+    int col_blocks,
+    int first_slot,
+    int slot_count
+) {
+    const int slot = first_slot + blockIdx.x;
+    if (blockIdx.x >= slot_count) return;
+    const int task_id = slot * pk_fused_globals::NUM_DEVICES + dev_idx;
+    const int num_blocks = row_blocks * col_blocks;
+    if (task_id >= num_blocks) return;
+
+    const int super_rows = (row_blocks / pk_fused_globals::SUPER_M)
+        * pk_fused_globals::SUPER_M;
+    const int final_rows = row_blocks - super_rows;
+    const int super_blocks = pk_fused_globals::SUPER_M * col_blocks;
+    int row_idx, col_idx;
+    task_to_tile(
+        task_id,
+        super_rows,
+        final_rows,
+        super_blocks,
+        col_blocks,
+        row_idx,
+        col_idx
+    );
+
+    const auto *wire_pairs = reinterpret_cast<const bf16_2 *>(
+        wire + static_cast<size_t>(slot) * HIERARCHICAL_TILE_ELEMENTS
+    );
+    constexpr int PAIRS_PER_TILE = HIERARCHICAL_TILE_ELEMENTS / 2;
+    for (int pair = threadIdx.x; pair < PAIRS_PER_TILE; pair += blockDim.x) {
+        const int element = pair * 2;
+        const int local_row = element / pk_fused_globals::COL_BLOCK;
+        const int local_col = element % pk_fused_globals::COL_BLOCK;
+        bf16_2 value;
+        asm volatile(
+            "ld.acquire.sys.global.u32 %0, [%1];"
+            : "=r"(*reinterpret_cast<uint32_t *>(&value))
+            : "l"(&wire_pairs[pair])
+            : "memory"
+        );
+        auto *multicast_ptr = reinterpret_cast<bf16_2 *>(
+            C.mc_ptr_at({
+                0,
+                0,
+                row_idx * pk_fused_globals::ROW_BLOCK + local_row,
+                col_idx * pk_fused_globals::COL_BLOCK + local_col
+            })
+        );
+        multimem<bf16_2>::st<memory_model::STRONG>(multicast_ptr, value);
+    }
+}
+
+__global__ void hierarchical_wait_ready_kernel(
+    const uint32_t *ready,
+    uint32_t *error,
+    int first_slot,
+    int slot_count,
+    uint32_t epoch,
+    uint64_t timeout_ns
+) {
+    if (threadIdx.x >= slot_count) return;
+    const int slot = first_slot + threadIdx.x;
+    const uint64_t start = globaltimer();
+    uint32_t value;
+    do {
+        asm volatile(
+            "ld.acquire.sys.global.u32 %0, [%1];"
+            : "=r"(value)
+            : "l"(&ready[slot])
+            : "memory"
+        );
+        if (value == epoch) return;
+        if (globaltimer() - start >= timeout_ns) {
+            uint32_t ignored;
+            const uint32_t code =
+                0x20000000u | static_cast<uint32_t>(slot);
+            asm volatile(
+                "atom.relaxed.sys.global.cas.b32 %0, [%1], %2, %3;"
+                : "=r"(ignored)
+                : "l"(error), "r"(0u), "r"(code)
+                : "memory"
+            );
+            return;
+        }
+    } while (true);
+}
+
+__global__ void hierarchical_local_join_kernel(
+    pk_fused_globals::barrier_pgl barrier,
+    uint32_t *error,
+    int dev_idx,
+    uint64_t timeout_ns
+) {
+    if (threadIdx.x != 0) return;
+    // Each owner rank reaches this kernel after its multicast unpack stream.
+    // Every rank is the sole writer of one monotonic sequence slot.  Separate
+    // slots give the waiter a direct acquire from every rank's release and
+    // remain reusable even if a fast rank publishes the following round.
+    const auto own_slot = hierarchical_join_slot(dev_idx);
+    uint32_t before;
+    asm volatile(
+        "ld.relaxed.sys.global.u32 %0, [%1];"
+        : "=r"(before)
+        : "l"(&barrier[dev_idx][own_slot])
+        : "memory"
+    );
+    const uint32_t sequence = before + 1;
+    #pragma unroll
+    for (int dst = 0; dst < pk_fused_globals::NUM_DEVICES; ++dst) {
+        asm volatile(
+            "st.release.sys.global.u32 [%0], %1;"
+            :: "l"(&barrier[dst][own_slot]), "r"(sequence)
+            : "memory"
+        );
+    }
+    const uint64_t wait_start = globaltimer();
+    #pragma unroll
+    for (int src = 0; src < pk_fused_globals::NUM_DEVICES; ++src) {
+        uint32_t value;
+        do {
+            asm volatile(
+                "ld.acquire.sys.global.u32 %0, [%1];"
+                : "=r"(value)
+                : "l"(&barrier[dev_idx][hierarchical_join_slot(src)])
+                : "memory"
+            );
+            if (value >= sequence) break;
+            if (globaltimer() - wait_start >= timeout_ns) {
+                uint32_t ignored;
+                const uint32_t code =
+                    0x10000000u | static_cast<uint32_t>(src);
+                asm volatile(
+                    "atom.relaxed.sys.global.cas.b32 %0, [%1], %2, %3;"
+                    : "=r"(ignored)
+                    : "l"(error), "r"(0u), "r"(code)
+                    : "memory"
+                );
+                return;
+            }
+        } while (true);
+    }
+}
+
 template <int NUM_THREADS, bool INSTRUMENT, Fp4Mode MODE>
 __global__ __launch_bounds__(NUM_THREADS, 1)
 void fp4_communication_kernel(
@@ -1183,6 +1467,137 @@ void launch_communication(
     }
 }
 
+template <int NUM_THREADS>
+void launch_hierarchical_pack_typed(
+    const pk_fused_globals &G,
+    bf16 *wire,
+    uint32_t *ready,
+    uint32_t *error,
+    uint32_t epoch,
+    int num_ctas,
+    WaitMode wait_mode,
+    bool enable_pdl,
+    cudaStream_t stream
+) {
+    auto kernel = hierarchical_pack_kernel<NUM_THREADS>;
+    if (enable_pdl) {
+        kittens::LaunchConfig<false, true> config(
+            dim3(num_ctas), dim3(NUM_THREADS), 0, stream
+        );
+        CUDACHECK(cudaLaunchKernelEx(
+            config,
+            kernel,
+            G,
+            wire,
+            ready,
+            error,
+            epoch,
+            wait_mode
+        ));
+    } else {
+        kernel<<<num_ctas, NUM_THREADS, 0, stream>>>(
+            G, wire, ready, error, epoch, wait_mode
+        );
+        CUDACHECK(cudaGetLastError());
+    }
+}
+
+void launch_hierarchical_pack(
+    const pk_fused_globals &G,
+    bf16 *wire,
+    uint32_t *ready,
+    uint32_t *error,
+    uint32_t epoch,
+    int num_ctas,
+    int num_threads,
+    WaitMode wait_mode,
+    bool enable_pdl,
+    cudaStream_t stream
+) {
+    switch (num_threads) {
+        case 256:
+            launch_hierarchical_pack_typed<256>(
+                G, wire, ready, error, epoch, num_ctas,
+                wait_mode, enable_pdl, stream
+            );
+            break;
+        case 512:
+            launch_hierarchical_pack_typed<512>(
+                G, wire, ready, error, epoch, num_ctas,
+                wait_mode, enable_pdl, stream
+            );
+            break;
+        case 1024:
+            launch_hierarchical_pack_typed<1024>(
+                G, wire, ready, error, epoch, num_ctas,
+                wait_mode, enable_pdl, stream
+            );
+            break;
+        default:
+            TORCH_CHECK(false, "pack_threads must be 256, 512, or 1024");
+    }
+}
+
+template <int NUM_THREADS>
+void launch_hierarchical_unpack_typed(
+    const pk_fused_globals::C_pgl &C,
+    const bf16 *wire,
+    int dev_idx,
+    int row_blocks,
+    int col_blocks,
+    int first_slot,
+    int slot_count,
+    cudaStream_t stream
+) {
+    hierarchical_unpack_kernel<NUM_THREADS><<<
+        slot_count, NUM_THREADS, 0, stream
+    >>>(
+        C,
+        wire,
+        dev_idx,
+        row_blocks,
+        col_blocks,
+        first_slot,
+        slot_count
+    );
+    CUDACHECK(cudaGetLastError());
+}
+
+void launch_hierarchical_unpack(
+    const pk_fused_globals::C_pgl &C,
+    const bf16 *wire,
+    int dev_idx,
+    int row_blocks,
+    int col_blocks,
+    int first_slot,
+    int slot_count,
+    int num_threads,
+    cudaStream_t stream
+) {
+    switch (num_threads) {
+        case 256:
+            launch_hierarchical_unpack_typed<256>(
+                C, wire, dev_idx, row_blocks, col_blocks,
+                first_slot, slot_count, stream
+            );
+            break;
+        case 512:
+            launch_hierarchical_unpack_typed<512>(
+                C, wire, dev_idx, row_blocks, col_blocks,
+                first_slot, slot_count, stream
+            );
+            break;
+        case 1024:
+            launch_hierarchical_unpack_typed<1024>(
+                C, wire, dev_idx, row_blocks, col_blocks,
+                first_slot, slot_count, stream
+            );
+            break;
+        default:
+            TORCH_CHECK(false, "unpack_threads must be 256, 512, or 1024");
+    }
+}
+
 void launch_compute(
     const pk_fused_globals &G,
     int num_ctas,
@@ -1489,6 +1904,50 @@ void check_trace_tensor(
     TORCH_CHECK(tensor.numel() >= min_elements, name, " is too small");
 }
 
+void check_hierarchical_epoch(uint32_t epoch) {
+    TORCH_CHECK(
+        epoch > 0 && epoch <= MAX_HIERARCHICAL_EPOCH,
+        "hierarchical epoch must be in 1..2^31-1"
+    );
+}
+
+void check_hierarchical_threads(int threads, const char *name) {
+    TORCH_CHECK(
+        threads == 256 || threads == 512 || threads == 1024,
+        name, " must be 256, 512, or 1024"
+    );
+}
+
+int hierarchical_owner_slots(int num_blocks, int local_rank) {
+    TORCH_CHECK(
+        local_rank >= 0 && local_rank < pk_fused_globals::NUM_DEVICES,
+        "hierarchical local rank must be in the eight-GPU NVLS group"
+    );
+    TORCH_CHECK(num_blocks > local_rank, "local rank owns no output tile");
+    return (
+        num_blocks + pk_fused_globals::NUM_DEVICES - 1 - local_rank
+    ) / pk_fused_globals::NUM_DEVICES;
+}
+
+int check_hierarchical_buffers(
+    const pk_fused_globals &G,
+    const at::Tensor &wire,
+    const at::Tensor &ready,
+    const at::Tensor &error
+) {
+    const int num_blocks = G.C.rows() / pk_fused_globals::ROW_BLOCK
+        * (G.C.cols() / pk_fused_globals::COL_BLOCK);
+    const int num_slots = hierarchical_owner_slots(num_blocks, G.dev_idx);
+    TORCH_CHECK(
+        wire.numel()
+            >= static_cast<int64_t>(num_slots) * HIERARCHICAL_TILE_ELEMENTS,
+        "wire is too small for the owner tiles"
+    );
+    TORCH_CHECK(ready.numel() >= num_slots, "ready has too few owner slots");
+    TORCH_CHECK(error.numel() >= 1, "error must contain at least one word");
+    return num_slots;
+}
+
 pk_fused_globals make_globals(
     const at::Tensor &A,
     const at::Tensor &B,
@@ -1500,12 +1959,40 @@ pk_fused_globals make_globals(
     kittens::py::device_check(A, B, C.data_, barrier.data_);
     kittens::py::parallel_tensor_check(C, barrier);
     TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "A and B must be 2D");
+    TORCH_CHECK(
+        A.scalar_type() == at::ScalarType::BFloat16
+            && B.scalar_type() == at::ScalarType::BFloat16,
+        "A and B must be BF16"
+    );
     TORCH_CHECK(A.size(1) == B.size(0), "incompatible GEMM dimensions");
-    TORCH_CHECK(C.data_.size(0) == A.size(0), "C rows mismatch");
-    TORCH_CHECK(C.data_.size(1) == B.size(1), "C cols mismatch");
+    TORCH_CHECK(
+        C.data_.dim() == 2 && C.data_.size(0) == A.size(0)
+            && C.data_.size(1) == B.size(1)
+            && C.data_.scalar_type() == at::ScalarType::BFloat16,
+        "C must be BF16 with shape [M, N]"
+    );
+    TORCH_CHECK(
+        barrier.data_.dim() == 3 && barrier.data_.size(0) >= 2
+            && barrier.data_.scalar_type() == at::ScalarType::Int,
+        "barrier must be INT32 with shape [>=2, rows, cols]"
+    );
     TORCH_CHECK(A.size(0) % pk_fused_globals::ROW_BLOCK == 0);
     TORCH_CHECK(B.size(1) % pk_fused_globals::COL_BLOCK == 0);
     TORCH_CHECK(A.size(1) % pk_fused_globals::RED_BLOCK == 0);
+    const int64_t row_blocks = A.size(0) / pk_fused_globals::ROW_BLOCK;
+    const int64_t col_blocks = B.size(1) / pk_fused_globals::COL_BLOCK;
+    TORCH_CHECK(
+        barrier.data_.size(1) >= row_blocks
+            && barrier.data_.size(2) >= std::max<int64_t>(col_blocks, 13),
+        "barrier is too small for tile and grid protocol counters"
+    );
+    TORCH_CHECK(
+        A.size(0) <= std::numeric_limits<int>::max()
+            && A.size(1) <= std::numeric_limits<int>::max()
+            && B.size(1) <= std::numeric_limits<int>::max()
+            && row_blocks * col_blocks <= std::numeric_limits<int>::max(),
+        "GEMM shape exceeds the 32-bit kernel indexing contract"
+    );
     TORCH_CHECK(
         A.size(1) / pk_fused_globals::RED_BLOCK
             >= pk_fused_globals::PIPELINE_STAGES,
@@ -1726,6 +2213,242 @@ void local_bf16_entrypoint(
         G, num_comp_ctas, false, false, false, stream, nullptr, nullptr
     );
     launch_split_reset(G, stream);
+}
+
+void hierarchical_bf16_producer_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    kittens::py::TKParallelTensor &C,
+    kittens::py::TKParallelTensor &barrier,
+    const at::Tensor &wire,
+    const at::Tensor &ready,
+    const at::Tensor &error,
+    const std::string &mode_string,
+    int num_comp_ctas,
+    int num_pack_ctas,
+    int pack_threads,
+    uint32_t epoch
+) {
+    c10::cuda::CUDAGuard guard(A.device());
+    auto mode = parse_mode(mode_string);
+    TORCH_CHECK(mode != LaunchMode::TWO_STREAM);
+    check_hierarchical_epoch(epoch);
+    TORCH_CHECK(num_pack_ctas > 0 && num_pack_ctas <= NUM_SMS);
+    check_hierarchical_threads(pack_threads, "pack_threads");
+    check_trace_tensor(wire, at::ScalarType::BFloat16, 1, "wire");
+    check_trace_tensor(ready, at::ScalarType::Int, 1, "ready");
+    check_trace_tensor(error, at::ScalarType::Int, 1, "error");
+    kittens::py::device_check(
+        A, B, C.data_, barrier.data_, wire, ready, error
+    );
+
+    auto G = make_globals(A, B, C, barrier, num_comp_ctas, num_pack_ctas);
+    check_hierarchical_buffers(G, wire, ready, error);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    launch_compute(
+        G,
+        num_comp_ctas,
+        mode != LaunchMode::DEFAULT_STREAM,
+        mode == LaunchMode::DEFAULT_STREAM || mode == LaunchMode::PDL_GRID,
+        false,
+        stream,
+        nullptr,
+        nullptr
+    );
+    WaitMode wait_mode = WaitMode::GRID_COUNTER;
+    bool enable_pdl = false;
+    if (mode == LaunchMode::PDL_GRID) {
+        wait_mode = WaitMode::PDL_GRID;
+        enable_pdl = true;
+    } else if (mode == LaunchMode::PDL_TILE) {
+        wait_mode = WaitMode::TILE_COUNTER;
+        enable_pdl = true;
+    }
+    launch_hierarchical_pack(
+        G,
+        reinterpret_cast<bf16 *>(wire.data_ptr()),
+        reinterpret_cast<uint32_t *>(ready.data_ptr<int>()),
+        reinterpret_cast<uint32_t *>(error.data_ptr<int>()),
+        epoch,
+        num_pack_ctas,
+        pack_threads,
+        wait_mode,
+        enable_pdl,
+        stream
+    );
+    launch_split_reset(G, stream);
+}
+
+void hierarchical_bf16_unpack_entrypoint(
+    kittens::py::TKParallelTensor &C,
+    const at::Tensor &wire,
+    int first_slot,
+    int slot_count,
+    int unpack_threads
+) {
+    c10::cuda::CUDAGuard guard(C.data_.device());
+    check_trace_tensor(wire, at::ScalarType::BFloat16, 1, "wire");
+    kittens::py::device_check(C.data_, wire);
+    kittens::py::parallel_tensor_check<pk_fused_globals::C_pgl>(C);
+    TORCH_CHECK(first_slot >= 0 && slot_count > 0);
+    check_hierarchical_threads(unpack_threads, "unpack_threads");
+    TORCH_CHECK(
+        C.data_.dim() == 2
+            && C.data_.size(0) % pk_fused_globals::ROW_BLOCK == 0
+            && C.data_.size(1) % pk_fused_globals::COL_BLOCK == 0,
+        "C shape must align to the ParallelKittens output tile"
+    );
+    const int64_t row_blocks64 =
+        C.data_.size(0) / pk_fused_globals::ROW_BLOCK;
+    const int64_t col_blocks64 =
+        C.data_.size(1) / pk_fused_globals::COL_BLOCK;
+    TORCH_CHECK(
+        row_blocks64 * col_blocks64 <= std::numeric_limits<int>::max(),
+        "C tile count exceeds the 32-bit unpack indexing contract"
+    );
+    const int row_blocks = static_cast<int>(row_blocks64);
+    const int col_blocks = static_cast<int>(col_blocks64);
+    const int num_blocks = row_blocks * col_blocks;
+    const int num_slots = hierarchical_owner_slots(num_blocks, C.local_rank_);
+    TORCH_CHECK(
+        first_slot <= num_slots - slot_count,
+        "unpack window exceeds the owner wire"
+    );
+    TORCH_CHECK(
+        wire.numel()
+            >= static_cast<int64_t>(num_slots) * HIERARCHICAL_TILE_ELEMENTS
+    );
+    auto C_pgl = kittens::py::parallel_tensor_to_pgl<
+        pk_fused_globals::C_pgl
+    >(C);
+    launch_hierarchical_unpack(
+        C_pgl,
+        reinterpret_cast<const bf16 *>(wire.data_ptr()),
+        C.local_rank_,
+        row_blocks,
+        col_blocks,
+        first_slot,
+        slot_count,
+        unpack_threads,
+        at::cuda::getCurrentCUDAStream().stream()
+    );
+}
+
+void hierarchical_bf16_pack_only_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    kittens::py::TKParallelTensor &C,
+    kittens::py::TKParallelTensor &barrier,
+    const at::Tensor &wire,
+    const at::Tensor &ready,
+    const at::Tensor &error,
+    int num_pack_ctas,
+    int pack_threads,
+    uint32_t epoch
+) {
+    c10::cuda::CUDAGuard guard(A.device());
+    check_hierarchical_epoch(epoch);
+    TORCH_CHECK(num_pack_ctas > 0 && num_pack_ctas <= NUM_SMS);
+    check_hierarchical_threads(pack_threads, "pack_threads");
+    check_trace_tensor(wire, at::ScalarType::BFloat16, 1, "wire");
+    check_trace_tensor(ready, at::ScalarType::Int, 1, "ready");
+    check_trace_tensor(error, at::ScalarType::Int, 1, "error");
+    kittens::py::device_check(
+        A, B, C.data_, barrier.data_, wire, ready, error
+    );
+    auto G = make_globals(A, B, C, barrier, 1, num_pack_ctas);
+    check_hierarchical_buffers(G, wire, ready, error);
+    launch_hierarchical_pack(
+        G,
+        reinterpret_cast<bf16 *>(wire.data_ptr()),
+        reinterpret_cast<uint32_t *>(ready.data_ptr<int>()),
+        reinterpret_cast<uint32_t *>(error.data_ptr<int>()),
+        epoch,
+        num_pack_ctas,
+        pack_threads,
+        WaitMode::NONE,
+        false,
+        at::cuda::getCurrentCUDAStream().stream()
+    );
+}
+
+void hierarchical_wait_ready_entrypoint(
+    const at::Tensor &ready,
+    const at::Tensor &error,
+    int first_slot,
+    int slot_count,
+    uint32_t epoch,
+    uint64_t timeout_ns
+) {
+    c10::cuda::CUDAGuard guard(ready.device());
+    check_trace_tensor(ready, at::ScalarType::Int, 1, "ready");
+    check_trace_tensor(error, at::ScalarType::Int, 1, "error");
+    kittens::py::device_check(ready, error);
+    TORCH_CHECK(first_slot >= 0 && slot_count > 0 && slot_count <= 1024);
+    TORCH_CHECK(
+        static_cast<int64_t>(first_slot) + slot_count <= ready.numel(),
+        "ready window exceeds the ready tensor"
+    );
+    check_hierarchical_epoch(epoch);
+    TORCH_CHECK(timeout_ns > 0, "ready timeout must be positive");
+    hierarchical_wait_ready_kernel<<<
+        1,
+        slot_count,
+        0,
+        at::cuda::getCurrentCUDAStream().stream()
+    >>>(
+        reinterpret_cast<const uint32_t *>(ready.data_ptr<int>()),
+        reinterpret_cast<uint32_t *>(error.data_ptr<int>()),
+        first_slot,
+        slot_count,
+        epoch,
+        timeout_ns
+    );
+    CUDACHECK(cudaGetLastError());
+}
+
+void hierarchical_bf16_local_join_entrypoint(
+    kittens::py::TKParallelTensor &barrier,
+    const at::Tensor &error,
+    uint64_t timeout_ns
+) {
+    c10::cuda::CUDAGuard guard(barrier.data_.device());
+    kittens::py::parallel_tensor_check<pk_fused_globals::barrier_pgl>(
+        barrier
+    );
+    TORCH_CHECK(
+        barrier.data_.is_cuda()
+            && barrier.data_.is_contiguous()
+            && barrier.data_.scalar_type() == at::ScalarType::Int,
+        "barrier must be a contiguous CUDA INT32 tensor"
+    );
+    TORCH_CHECK(
+        barrier.data_.dim() == 3
+            && barrier.data_.size(0) >= 2
+            && barrier.data_.size(1) >= 1
+            && barrier.data_.size(2) >= 13,
+        "barrier is too small for the hierarchical completion counter"
+    );
+    TORCH_CHECK(
+        barrier.local_rank_ >= 0
+            && barrier.local_rank_ < pk_fused_globals::NUM_DEVICES,
+        "hierarchical local rank must be in the eight-GPU NVLS group"
+    );
+    check_trace_tensor(error, at::ScalarType::Int, 1, "error");
+    kittens::py::device_check(barrier.data_, error);
+    TORCH_CHECK(timeout_ns > 0, "local join timeout must be positive");
+    auto barrier_pgl = kittens::py::parallel_tensor_to_pgl<
+        pk_fused_globals::barrier_pgl
+    >(barrier);
+    hierarchical_local_join_kernel<<<
+        1, 1, 0, at::cuda::getCurrentCUDAStream().stream()
+    >>>(
+        barrier_pgl,
+        reinterpret_cast<uint32_t *>(error.data_ptr<int>()),
+        barrier.local_rank_,
+        timeout_ns
+    );
+    CUDACHECK(cudaGetLastError());
 }
 
 void fp4_entrypoint(
@@ -2239,6 +2962,62 @@ PYBIND11_MODULE(_C, m) {
         pybind11::arg("C"),
         pybind11::arg("barrier"),
         pybind11::arg("num_comp_ctas")
+    );
+    m.def(
+        "hierarchical_bf16_producer",
+        &pdl_gemm_ar::hierarchical_bf16_producer_entrypoint,
+        pybind11::arg("A"),
+        pybind11::arg("B"),
+        pybind11::arg("C"),
+        pybind11::arg("barrier"),
+        pybind11::arg("wire"),
+        pybind11::arg("ready"),
+        pybind11::arg("error"),
+        pybind11::arg("mode"),
+        pybind11::arg("num_comp_ctas"),
+        pybind11::arg("num_pack_ctas"),
+        pybind11::arg("pack_threads"),
+        pybind11::arg("epoch")
+    );
+    m.def(
+        "hierarchical_bf16_unpack",
+        &pdl_gemm_ar::hierarchical_bf16_unpack_entrypoint,
+        pybind11::arg("C"),
+        pybind11::arg("wire"),
+        pybind11::arg("first_slot"),
+        pybind11::arg("slot_count"),
+        pybind11::arg("unpack_threads")
+    );
+    m.def(
+        "hierarchical_bf16_pack_only",
+        &pdl_gemm_ar::hierarchical_bf16_pack_only_entrypoint,
+        pybind11::arg("A"),
+        pybind11::arg("B"),
+        pybind11::arg("C"),
+        pybind11::arg("barrier"),
+        pybind11::arg("wire"),
+        pybind11::arg("ready"),
+        pybind11::arg("error"),
+        pybind11::arg("num_pack_ctas"),
+        pybind11::arg("pack_threads"),
+        pybind11::arg("epoch")
+    );
+    m.def(
+        "hierarchical_wait_ready",
+        &pdl_gemm_ar::hierarchical_wait_ready_entrypoint,
+        pybind11::arg("ready"),
+        pybind11::arg("error"),
+        pybind11::arg("first_slot"),
+        pybind11::arg("slot_count"),
+        pybind11::arg("epoch"),
+        pybind11::arg("timeout_ns")
+    );
+    m.def(
+        "hierarchical_bf16_local_join",
+        &pdl_gemm_ar::hierarchical_bf16_local_join_entrypoint,
+        pybind11::arg("barrier"),
+        pybind11::arg("error"),
+        pybind11::arg("timeout_ns")
     );
     m.def(
         "matmul_all_reduce_fp4",

@@ -5,6 +5,11 @@ import unittest
 
 from ..loopback_backend import LoopbackTransport
 from ..cost_model import PipelineCost
+from ..pk_pipeline import (
+    TILE_BYTES_BF16,
+    OwnerWireLayout,
+    PipelineConfig,
+)
 from ..protocol import (
     ChunkPlan,
     CompletionBoard,
@@ -107,19 +112,88 @@ class LoopbackTest(unittest.TestCase):
 class CostModelTest(unittest.TestCase):
     def test_pipeline_bound_and_overlap_efficiency(self) -> None:
         model = PipelineCost(
+            compute_ms=0.0,
             local_reduce_ms=4.0,
             inter_node_ms=8.0,
             local_broadcast_ms=4.0,
-            control_ms=1.0,
+            ready_control_ms=0.0,
+            tail_control_ms=1.0,
+            window_orchestration_ms=0.0,
             num_chunks=4,
             observed_sequential_ms=17.0,
             observed_pipeline_ms=11.0,
             flat_ms=20.0,
         )
         self.assertEqual(model.isolated_sequential_ms, 17.0)
-        self.assertEqual(model.lower_bound_ms, 11.0)
+        self.assertEqual(model.communication_estimated_ideal_overlap_ms, 11.0)
+        self.assertEqual(model.estimated_ideal_overlap_ms, 11.0)
         self.assertEqual(model.overlap_efficiency, 1.0)
         self.assertEqual(model.perfect_overlap_opportunity_vs_flat, 0.45)
+
+    def test_compute_is_a_pipeline_stage_in_the_full_bound(self) -> None:
+        model = PipelineCost(
+            compute_ms=8.0,
+            local_reduce_ms=4.0,
+            inter_node_ms=4.0,
+            local_broadcast_ms=4.0,
+            ready_control_ms=0.0,
+            tail_control_ms=0.0,
+            window_orchestration_ms=0.0,
+            num_chunks=4,
+        )
+        self.assertEqual(model.communication_estimated_ideal_overlap_ms, 6.0)
+        self.assertEqual(model.estimated_ideal_overlap_ms, 11.0)
+
+    def test_ready_control_is_a_windowed_stage(self) -> None:
+        model = PipelineCost(
+            compute_ms=0.0,
+            ready_control_ms=8.0,
+            local_reduce_ms=4.0,
+            inter_node_ms=4.0,
+            local_broadcast_ms=4.0,
+            tail_control_ms=1.0,
+            window_orchestration_ms=0.0,
+            num_chunks=4,
+        )
+        self.assertEqual(model.communication_estimated_ideal_overlap_ms, 12.0)
+        self.assertEqual(model.estimated_ideal_overlap_ms, 12.0)
+
+    def test_window_orchestration_is_not_counted_three_times(self) -> None:
+        model = PipelineCost(
+            compute_ms=0.0,
+            ready_control_ms=5.0,
+            local_reduce_ms=4.0,
+            inter_node_ms=5.0,
+            local_broadcast_ms=5.0,
+            tail_control_ms=0.0,
+            window_orchestration_ms=1.0,
+            num_chunks=4,
+        )
+        self.assertEqual(model.isolated_sequential_ms, 19.0)
+        self.assertEqual(model.communication_estimated_ideal_overlap_ms, 8.0)
+
+
+class OwnerWireLayoutTest(unittest.TestCase):
+    def test_8192_shape_has_256_slots_and_16_mib_per_rank(self) -> None:
+        layout = OwnerWireLayout(m=8192, n=8192, local_rank=0)
+        self.assertEqual(layout.num_tiles, 2048)
+        self.assertEqual(layout.num_owner_slots, 256)
+        self.assertEqual(layout.wire_bytes, 16 * 1024 * 1024)
+        self.assertEqual(TILE_BYTES_BF16, 64 * 1024)
+
+    def test_uneven_owner_counts_and_final_window(self) -> None:
+        first = OwnerWireLayout(m=128, n=2304, local_rank=0)
+        last = OwnerWireLayout(m=128, n=2304, local_rank=7)
+        self.assertEqual(first.num_tiles, 9)
+        self.assertEqual(first.num_owner_slots, 2)
+        self.assertEqual(last.num_owner_slots, 1)
+        self.assertEqual(first.windows(3), ((0, 2),))
+
+    def test_pipeline_config_rejects_unbounded_wait_grid(self) -> None:
+        with self.assertRaises(ValueError):
+            PipelineConfig(window_tiles=0)
+        with self.assertRaises(ValueError):
+            PipelineConfig(window_tiles=1025)
 
 
 if __name__ == "__main__":

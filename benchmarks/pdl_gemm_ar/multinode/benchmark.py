@@ -76,7 +76,7 @@ def validate(
 
     operations = {"sequential": lambda: collective.sequential(work, chunks)}
     operations.update(
-        {f"pipeline_d{depth}": lambda d=depth: collective.pipelined(work, chunks, d) for depth in depths}
+        {f"window_d{depth}": lambda d=depth: collective.windowed(work, chunks, d) for depth in depths}
     )
     for name, operation in operations.items():
         work.copy_(source)
@@ -105,7 +105,7 @@ def make_record(
         "backend": "nccl",
         "dtype": "bf16",
         "chunk_bytes": chunk_bytes,
-        "pipeline_depth": depth,
+        "window_depth": depth,
         "total_bytes": total_bytes,
         "emulated_nodes": emulated_nodes,
         "topology": topology.as_dict(),
@@ -163,9 +163,9 @@ def main() -> None:
         ]
         operations.extend(
             (
-                "pipeline",
+                "windowed",
                 depth,
-                lambda d=depth: collective.pipelined(work, chunks, d),
+                lambda d=depth: collective.windowed(work, chunks, d),
             )
             for depth in args.depths
         )
@@ -188,25 +188,28 @@ def main() -> None:
             records.append(record)
 
         median_by_mode = {
-            (str(record["mode"]), record["pipeline_depth"]): float(record["median_ms"])
+            (str(record["mode"]), record["window_depth"]): float(record["median_ms"])
             for record in chunk_records
         }
-        best_depth = min(args.depths, key=lambda depth: median_by_mode[("pipeline", depth)])
+        best_depth = min(args.depths, key=lambda depth: median_by_mode[("windowed", depth)])
         model = PipelineCost(
+            compute_ms=0.0,
             local_reduce_ms=median_by_mode[("local_reduce", None)],
             inter_node_ms=median_by_mode[("inter_node", None)],
             local_broadcast_ms=median_by_mode[("local_broadcast", None)],
-            control_ms=0.0,
+            ready_control_ms=0.0,
+            tail_control_ms=0.0,
+            window_orchestration_ms=0.0,
             num_chunks=plan.num_chunks,
             observed_sequential_ms=median_by_mode[("sequential", None)],
-            observed_pipeline_ms=median_by_mode[("pipeline", best_depth)],
+            observed_pipeline_ms=median_by_mode[("windowed", best_depth)],
             flat_ms=median_by_mode[("flat", None)],
         )
         records.append(
             {
                 "kind": "hierarchical_bf16_cost_model",
                 "chunk_bytes": chunk_bytes,
-                "best_pipeline_depth": best_depth,
+                "best_window_depth": best_depth,
                 "emulated_nodes": emulated_nodes,
                 "topology": topology.as_dict(),
                 **model.as_dict(),

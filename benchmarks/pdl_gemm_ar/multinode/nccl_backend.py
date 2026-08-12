@@ -14,11 +14,24 @@ from .topology import RankTopology
 class NcclGroups:
     local_reduce: Any
     local_broadcast: Any
-    lanes: tuple[Any, ...]
+    lane_channels: tuple[tuple[Any, ...], ...]
+
+    def lane(self, local_rank: int, channel: int = 0) -> Any:
+        return self.lane_channels[local_rank][channel]
+
+    @property
+    def num_lane_channels(self) -> int:
+        return len(self.lane_channels[0])
 
 
-def create_nccl_groups(topology: RankTopology) -> NcclGroups:
+def create_nccl_groups(
+    topology: RankTopology,
+    lane_channels: int = 1,
+) -> NcclGroups:
     """Create every group in global order, returning the groups for this rank."""
+
+    if lane_channels <= 0:
+        raise ValueError("lane_channels must be positive")
 
     local_reduce = None
     local_broadcast = None
@@ -33,7 +46,12 @@ def create_nccl_groups(topology: RankTopology) -> NcclGroups:
     lanes = []
     for local_rank in range(topology.local_world_size):
         lanes.append(
-            dist.new_group(list(topology.ranks_in_lane(local_rank)), backend="nccl")
+            tuple(
+                dist.new_group(
+                    list(topology.ranks_in_lane(local_rank)), backend="nccl"
+                )
+                for _ in range(lane_channels)
+            )
         )
 
     if local_reduce is None or local_broadcast is None:
@@ -60,18 +78,18 @@ class NcclHierarchicalCollective:
                 dist.all_reduce(
                     view,
                     op=dist.ReduceOp.SUM,
-                    group=self.groups.lanes[chunk.owner_local_rank],
+                    group=self.groups.lane(chunk.owner_local_rank),
                 )
             dist.broadcast(view, src=owner, group=self.groups.local_broadcast)
 
-    def pipelined(
+    def windowed(
         self,
         tensor: torch.Tensor,
         chunks: tuple[ChunkDesc, ...],
         depth: int,
     ) -> None:
         if depth <= 0:
-            raise ValueError("pipeline depth must be positive")
+            raise ValueError("window depth must be positive")
         for first in range(0, len(chunks), depth):
             window = chunks[first : first + depth]
             local_works = []
@@ -94,7 +112,7 @@ class NcclHierarchicalCollective:
                         dist.all_reduce(
                             self._view(tensor, chunk),
                             op=dist.ReduceOp.SUM,
-                            group=self.groups.lanes[chunk.owner_local_rank],
+                            group=self.groups.lane(chunk.owner_local_rank),
                             async_op=True,
                         )
                     )
@@ -135,7 +153,7 @@ class NcclHierarchicalCollective:
                 dist.all_reduce(
                     self._view(tensor, chunk),
                     op=dist.ReduceOp.SUM,
-                    group=self.groups.lanes[chunk.owner_local_rank],
+                    group=self.groups.lane(chunk.owner_local_rank),
                 )
 
     def local_broadcast_only(
