@@ -1,5 +1,17 @@
 # ParallelKittens GEMM+AllReduce scheduling comparison
 
+The follow-on hierarchical BF16 work lives in [`multinode/`](multinode/).  Its
+transport-neutral protocol deliberately separates same-node NVLS scheduling
+from inter-node completion.  Start with the dependency-free protocol tests:
+
+```bash
+python -m unittest discover -s benchmarks/pdl_gemm_ar/multinode/tests -t . -v
+```
+
+The loopback backend validates chunk ownership, partial chunks, exactly-once
+phase publication, epoch reuse, and timeout behavior.  It is not a performance
+model for NVLink or RDMA.
+
 This experiment keeps the pinned ParallelKittens BF16 `128x256x64`, four-stage
 GEMM and NVLS AllReduce arithmetic while comparing execution organization:
 
