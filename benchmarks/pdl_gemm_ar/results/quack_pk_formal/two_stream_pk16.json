@@ -1,0 +1,110 @@
+{
+  "comm": {
+    "ctas": 16,
+    "resource_no_padding": {
+      "communication": {
+        "max_dynamic_smem_bytes": 0,
+        "max_threads_per_block": 1024,
+        "num_regs": 28,
+        "predicted_blocks_per_sm": 2,
+        "requested_dynamic_smem_bytes": 0,
+        "static_smem_bytes": 0,
+        "threads": 1024
+      },
+      "compute": {
+        "consumer_register_target": 232,
+        "dynamic_smem_bytes": 231424,
+        "max_dynamic_smem_bytes": 231424,
+        "num_regs": 168,
+        "predicted_blocks_per_sm": 1,
+        "producer_register_target": 40,
+        "static_smem_bytes": 80,
+        "threads": 384
+      },
+      "num_sms": 132,
+      "pipeline_stages": 4,
+      "tile_k": 64,
+      "tile_m": 128,
+      "tile_n": 256
+    },
+    "resource_with_padding": {
+      "communication": {
+        "max_dynamic_smem_bytes": 131072,
+        "max_threads_per_block": 1024,
+        "num_regs": 28,
+        "predicted_blocks_per_sm": 1,
+        "requested_dynamic_smem_bytes": 131072,
+        "static_smem_bytes": 0,
+        "threads": 1024
+      },
+      "compute": {
+        "consumer_register_target": 232,
+        "dynamic_smem_bytes": 231424,
+        "max_dynamic_smem_bytes": 231424,
+        "num_regs": 168,
+        "predicted_blocks_per_sm": 1,
+        "producer_register_target": 40,
+        "static_smem_bytes": 80,
+        "threads": 384
+      },
+      "num_sms": 132,
+      "pipeline_stages": 4,
+      "tile_k": 64,
+      "tile_m": 128,
+      "tile_n": 256
+    },
+    "smem_kib": 128,
+    "threads": 1024
+  },
+  "correctness": null,
+  "fused_comm_roles": 32,
+  "iterations": 3,
+  "kind": "quack_parallelkittens_comparison",
+  "mode_order": [
+    "pk_bf16_two_stream"
+  ],
+  "preheat_ms": 0,
+  "quack_config": {
+    "cluster_k": 1,
+    "cluster_m": 1,
+    "cluster_n": 1,
+    "device_capacity": 9,
+    "is_dynamic_persistent": false,
+    "max_swizzle_size": 8,
+    "num_warps": null,
+    "pingpong": false,
+    "split_k": 1,
+    "swap_ab": false,
+    "tile_k": 64,
+    "tile_m": 128,
+    "tile_n": 256,
+    "use_tma_gather": false
+  },
+  "results": {
+    "pk_bf16_two_stream": {
+      "max_ms": 0.5753920078277588,
+      "mean_ms": 0.5690026680628458,
+      "median_ms": 0.5680959820747375,
+      "min_ms": 0.5635200142860413,
+      "p95_ms": 0.5680959820747375,
+      "samples_ms": [
+        0.5753920078277588,
+        0.5680959820747375,
+        0.5635200142860413
+      ]
+    }
+  },
+  "shape": {
+    "k": 1024,
+    "m": 8192,
+    "n": 8192
+  },
+  "tile": {
+    "k": 64,
+    "m": 128,
+    "n": 256
+  },
+  "tile_count": 2048,
+  "tile_remainder_mod_132": 68,
+  "warmups": 1
+}
